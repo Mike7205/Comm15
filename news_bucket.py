@@ -4,15 +4,17 @@ news_bucket.py
 Twice-daily news aggregator for 27 global market tickers.
 
 Buckets (pandas DataFrames, persisted as CSV):
-  fyahoo_bucket       – Yahoo Finance / yfinance
+  fyahoo_bucket        – Yahoo Finance / yfinance
   alpha_vantage_bucket – Alpha Vantage NEWS_SENTIMENT
-  finnhub_bucket      – Finnhub company/market news
-  twelve_data_bucket  – Twelve Data news
-  eodhd_bucket        – EODHD news
-  coingecko_bucket    – CoinGecko (BTC, ETH only)
+  finnhub_bucket       – Finnhub company/market news
+  twelve_data_bucket   – Twelve Data news
+  eodhd_bucket         – EODHD news
+  coingecko_bucket     – CoinGecko (BTC, ETH only)
+  fred_rates_bucket    – FRED: central bank rates (Fed, ECB, BoJ, PBOC)
 
-Columns: Date + all 27 ticker symbols
-Each cell: pipe-separated news headlines for that ticker on that day.
+News buckets  – Columns: Date + 27 ticker symbols, cells = pipe-separated headlines.
+fred_rates    – Columns: Date, FEDFUNDS, ECBDFR, IRSTCI01JPM156N, IRSTCI01CNM156N
+                + derived columns: rate (%), prev_rate (%), change_bps, as_of date.
 
 Scheduler: runs update at 09:00 and 16:00 daily.
 API keys: set as environment variables or in .env file.
@@ -44,6 +46,7 @@ AV_KEY      = os.getenv("ALPHA_VANTAGE_KEY", "")
 FH_KEY      = os.getenv("FINNHUB_KEY", "")
 TD_KEY      = os.getenv("TWELVE_DATA_KEY", "")
 EODHD_KEY   = os.getenv("EODHD_KEY", "")
+FRED_KEY    = os.getenv("FRED_KEY", "")
 # CoinGecko public API – no key required
 
 # ── Data directory ────────────────────────────────────────────────────────────
@@ -138,6 +141,15 @@ CG_MAP = {
     'ETH-USD': 'ethereum',
 }
 
+# ── FRED – central bank policy rates ─────────────────────────────────────────
+FRED_SERIES = {
+    'FEDFUNDS':           {'label': 'Fed (USA)',  'bank': 'Federal Reserve'},
+    'ECBDFR':             {'label': 'ECB (EU)',   'bank': 'European Central Bank'},
+    'IRSTCI01JPM156N':    {'label': 'BoJ (Japan)','bank': 'Bank of Japan'},
+    'IRSTCI01CNM156N':    {'label': 'PBOC (China)','bank': 'Peoples Bank of China'},
+}
+FRED_BUCKET_COLS = ['Date'] + list(FRED_SERIES.keys())
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Bucket persistence helpers
 # ─────────────────────────────────────────────────────────────────────────────
@@ -146,14 +158,14 @@ def _csv_path(name: str) -> Path:
     return DATA_DIR / f"{name}.csv"
 
 
-def load_bucket(name: str) -> pd.DataFrame:
+def load_bucket(name: str, columns: list = None) -> pd.DataFrame:
     """Load bucket CSV or create empty DataFrame with correct columns."""
     path = _csv_path(name)
+    cols = columns or (['Date'] + TICKERS)
     if path.exists():
         df = pd.read_csv(path, parse_dates=['Date'])
         return df
-    df = pd.DataFrame(columns=['Date'] + TICKERS)
-    return df
+    return pd.DataFrame(columns=cols)
 
 
 def save_bucket(name: str, df: pd.DataFrame) -> None:
@@ -309,6 +321,175 @@ def fetch_eodhd(ticker: str) -> str:
         return ''
 
 
+def _make_cell(label: str, rate: float, as_of: str,
+               prev_rate: float = None, change_bps: float = None) -> str:
+    """Format a rate observation into a readable cell string."""
+    cell = f"{label}: {rate:.2f}% (as of {as_of})"
+    if change_bps is not None:
+        sign = '+' if change_bps >= 0 else ''
+        cell += f" | prev: {prev_rate:.2f}% | change: {sign}{change_bps:.1f} bps"
+    return cell
+
+
+def fetch_fred_series(series_id: str) -> dict:
+    """
+    Fetch latest + previous observation for a FRED series.
+    Requires FRED_KEY (free registration at fred.stlouisfed.org).
+    Returns dict: rate, prev_rate, change_bps, as_of, label, bank.
+    """
+    if not FRED_KEY:
+        return {}
+    meta = FRED_SERIES.get(series_id, {})
+    try:
+        r = requests.get(
+            'https://api.stlouisfed.org/fred/series/observations',
+            params={
+                'series_id': series_id,
+                'api_key':   FRED_KEY,
+                'sort_order': 'desc',
+                'limit': 13,
+                'file_type': 'json',
+            },
+            timeout=10
+        )
+        r.raise_for_status()
+        valid = [o for o in r.json().get('observations', [])
+                 if o.get('value', '.') != '.']
+        if not valid:
+            return {}
+        rate      = float(valid[0]['value'])
+        as_of     = valid[0]['date']
+        prev_rate = float(valid[1]['value']) if len(valid) > 1 else None
+        change_bps = round((rate - prev_rate) * 100, 1) if prev_rate is not None else None
+        return {
+            'rate': rate, 'prev_rate': prev_rate,
+            'change_bps': change_bps, 'as_of': as_of,
+            'label': meta.get('label', series_id),
+            'bank':  meta.get('bank', ''),
+        }
+    except Exception as e:
+        log.warning(f"[FRED] {series_id}: {e}")
+        return {}
+
+
+def fetch_ecb_rate_no_key() -> dict:
+    """
+    Fetch ECB Deposit Facility Rate from ECB Data Portal (no API key required).
+    Returns same dict shape as fetch_fred_series.
+    """
+    try:
+        r = requests.get(
+            'https://data-api.ecb.europa.eu/service/data/FM/B.U2.EUR.4F.KR.DFR.LEV',
+            params={'format': 'jsondata', 'lastNObservations': 2},
+            headers={'Accept': 'application/json'},
+            timeout=10
+        )
+        r.raise_for_status()
+        d      = r.json()
+        series = d['dataSets'][0]['series']
+        key    = list(series.keys())[0]
+        obs    = series[key]['observations']
+        periods = d['structure']['dimensions']['observation'][0]['values']
+        idxs   = sorted(obs.keys(), key=int)
+        last, prev = idxs[-1], idxs[-2] if len(idxs) > 1 else idxs[-1]
+        rate      = float(obs[last][0])
+        prev_rate = float(obs[prev][0])
+        as_of     = periods[int(last)]['id']
+        change_bps = round((rate - prev_rate) * 100, 1)
+        return {
+            'rate': rate, 'prev_rate': prev_rate,
+            'change_bps': change_bps, 'as_of': as_of,
+            'label': 'ECB (EU)', 'bank': 'European Central Bank',
+        }
+    except Exception as e:
+        log.warning(f"[ECB Portal] {e}")
+        return {}
+
+
+def fetch_fed_rate_alpha_vantage() -> dict:
+    """
+    Fetch US Federal Funds Rate from Alpha Vantage (requires AV_KEY).
+    Fallback when FRED_KEY is not set.
+    """
+    if not AV_KEY:
+        return {}
+    try:
+        r = requests.get(
+            'https://www.alphavantage.co/query',
+            params={'function': 'FEDERAL_FUNDS_RATE', 'interval': 'monthly', 'apikey': AV_KEY},
+            timeout=10
+        )
+        r.raise_for_status()
+        data = r.json().get('data', [])
+        if len(data) < 2:
+            return {}
+        rate      = float(data[0]['value'])
+        prev_rate = float(data[1]['value'])
+        as_of     = data[0]['date']
+        change_bps = round((rate - prev_rate) * 100, 1)
+        return {
+            'rate': rate, 'prev_rate': prev_rate,
+            'change_bps': change_bps, 'as_of': as_of,
+            'label': 'Fed (USA)', 'bank': 'Federal Reserve',
+        }
+    except Exception as e:
+        log.warning(f"[AV Fed rate] {e}")
+        return {}
+
+
+def update_fred_rates_bucket() -> None:
+    """
+    Fetch all 4 central bank policy rates and upsert into fred_rates_bucket.
+
+    Source priority per rate:
+      FEDFUNDS         → FRED (key) → Alpha Vantage (key) → empty
+      ECBDFR           → FRED (key) → ECB Data Portal (no key) → empty
+      IRSTCI01JPM156N  → FRED (key) → empty
+      IRSTCI01CNM156N  → FRED (key) → empty
+    """
+    log.info("Updating fred_rates_bucket ...")
+    df = load_bucket('fred_rates_bucket', columns=FRED_BUCKET_COLS)
+    today_str = date.today().isoformat()
+    updates   = {}
+
+    for series_id in FRED_SERIES:
+        result = fetch_fred_series(series_id)
+
+        # Fallbacks when no FRED key
+        if not result:
+            if series_id == 'ECBDFR':
+                result = fetch_ecb_rate_no_key()
+            elif series_id == 'FEDFUNDS':
+                result = fetch_fed_rate_alpha_vantage()
+
+        if result:
+            updates[series_id] = _make_cell(
+                result['label'], result['rate'], result['as_of'],
+                result.get('prev_rate'), result.get('change_bps')
+            )
+            log.info(f"  {series_id}: {updates[series_id]}")
+        else:
+            updates[series_id] = ''
+            log.warning(f"  {series_id}: no data (set FRED_KEY for full coverage)")
+        time.sleep(0.5)
+
+    # Upsert row
+    if today_str in df['Date'].astype(str).values:
+        mask = df['Date'].astype(str) == today_str
+        for col, val in updates.items():
+            if col in df.columns and val:
+                df.loc[mask, col] = val
+    else:
+        row = {'Date': today_str}
+        row.update({s: '' for s in FRED_SERIES})
+        row.update({k: v for k, v in updates.items() if v})
+        df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
+
+    save_bucket('fred_rates_bucket', df)
+    filled = sum(1 for v in updates.values() if v)
+    log.info(f"fred_rates_bucket done ({filled}/{len(FRED_SERIES)} series filled)")
+
+
 def fetch_coingecko(ticker: str) -> str:
     """Return market summary text from CoinGecko (BTC/ETH only)."""
     cg_id = CG_MAP.get(ticker)
@@ -372,14 +553,18 @@ def update_bucket(bucket_name: str, fetch_fn) -> None:
 
 
 def run_all_updates() -> None:
-    """Run updates for all 6 buckets."""
-    log.info("═══ Starting full news update ═══")
+    """Run updates for all 6 news buckets + fred_rates_bucket."""
+    log.info("Starting full update ...")
     for bucket_name, fetch_fn in SOURCES:
         try:
             update_bucket(bucket_name, fetch_fn)
         except Exception as e:
             log.error(f"[{bucket_name}] Unexpected error: {e}")
-    log.info("═══ Full update complete ═══")
+    try:
+        update_fred_rates_bucket()
+    except Exception as e:
+        log.error(f"[fred_rates_bucket] Unexpected error: {e}")
+    log.info("Full update complete")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -388,10 +573,11 @@ def run_all_updates() -> None:
 
 def main():
     log.info("news_bucket.py started – scheduled at 09:00 and 16:00 daily")
-    log.info(f"API keys loaded: AV={'✔' if AV_KEY else '✗'}  "
-             f"Finnhub={'✔' if FH_KEY else '✗'}  "
-             f"TwelveData={'✔' if TD_KEY else '✗'}  "
-             f"EODHD={'✔' if EODHD_KEY else '✗'}")
+    log.info(f"API keys: AV={'OK' if AV_KEY else '--'}  "
+             f"Finnhub={'OK' if FH_KEY else '--'}  "
+             f"TwelveData={'OK' if TD_KEY else '--'}  "
+             f"EODHD={'OK' if EODHD_KEY else '--'}  "
+             f"FRED={'OK' if FRED_KEY else 'public (no key)'}")
 
     # Run immediately on startup so buckets are populated right away
     run_all_updates()
