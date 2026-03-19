@@ -23,6 +23,7 @@ API keys: set as environment variables or in .env file.
 import os
 import time
 import logging
+import subprocess
 import requests
 import schedule
 import pandas as pd
@@ -552,8 +553,45 @@ def update_bucket(bucket_name: str, fetch_fn) -> None:
     log.info(f"✔ {bucket_name} done ({len([v for v in updates.values() if v])}/{len(TICKERS)} tickers filled)")
 
 
+def git_push_data() -> None:
+    """
+    Commit all changed CSV files in data/ and push to GitHub.
+    Requires the script to run inside a git repository (the Comm15 repo).
+    """
+    try:
+        repo_root = Path(__file__).parent
+
+        # Check if there are any changes in data/
+        status = subprocess.run(
+            ['git', 'status', '--porcelain', 'data/'],
+            cwd=repo_root, capture_output=True, text=True
+        )
+        if not status.stdout.strip():
+            log.info("[git] No changes in data/ – nothing to push")
+            return
+
+        changed_files = [line.strip().split()[-1] for line in status.stdout.strip().splitlines()]
+        log.info(f"[git] Changed files: {changed_files}")
+
+        timestamp = datetime.now().strftime('%Y-%m-%d %H:%M')
+
+        subprocess.run(['git', 'add', 'data/'], cwd=repo_root, check=True)
+        subprocess.run(
+            ['git', 'commit', '-m', f'auto: update news buckets {timestamp}'],
+            cwd=repo_root, check=True
+        )
+        subprocess.run(['git', 'push'], cwd=repo_root, check=True)
+
+        log.info(f"[git] Pushed {len(changed_files)} CSV file(s) to GitHub")
+
+    except subprocess.CalledProcessError as e:
+        log.error(f"[git] Push failed: {e}")
+    except Exception as e:
+        log.error(f"[git] Unexpected error: {e}")
+
+
 def run_all_updates() -> None:
-    """Run updates for all 6 news buckets + fred_rates_bucket."""
+    """Run updates for all 6 news buckets + fred_rates_bucket, then push CSVs to GitHub."""
     log.info("Starting full update ...")
     for bucket_name, fetch_fn in SOURCES:
         try:
@@ -564,6 +602,8 @@ def run_all_updates() -> None:
         update_fred_rates_bucket()
     except Exception as e:
         log.error(f"[fred_rates_bucket] Unexpected error: {e}")
+
+    git_push_data()
     log.info("Full update complete")
 
 
