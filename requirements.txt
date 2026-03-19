@@ -4,3 +4,5 @@ numpy>=1.24.0
 plotly>=5.18.0
 yfinance>=0.2.40
 streamlit-echarts>=0.4.0
+schedule>=1.2.0
+python-dotenv>=1.0.0
